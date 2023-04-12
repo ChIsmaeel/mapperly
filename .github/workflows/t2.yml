@@ -1,0 +1,114 @@
+name: test
+
+on:
+  workflow_call:
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-dotnet@v3.0.3
+      - run: dotnet tool restore
+      - run: dotnet format --verify-no-changes
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-dotnet@v3.0.3
+      - run: dotnet build /p:TreatWarningsAsErrors=true
+      - run: dotnet test --no-build /p:CollectCoverage=true /p:CoverletOutputFormat=opencover
+      - uses: codecov/codecov-action@v3
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: sudo apt update && sudo apt -y install zipmerge # zipmerge is used to merge the multi target nupkg
+      - uses: actions/setup-dotnet@v3.0.3
+      - run: dotnet tool restore
+      - run: RELEASE_VERSION="0.0.1-dev.$GITHUB_RUN_ID" ./build/package.sh
+      - run: dotnet meziantou.validate-nuget-package ./artifacts/*.nupkg
+      - run: dotnet validate package local ./artifacts/*.nupkg
+      - uses: actions/upload-artifact@v3
+        with:
+          name: mapperly-nupkg
+          path: artifacts/*.nupkg
+      - if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: verify-test-results
+          path: '**/*.received.*'
+  integration-test:
+    needs: package
+    runs-on: ubuntu-latest
+    # use an alpine container to ensure only the dotnet version we want to test is installed,
+    # ubuntu-latest already contains several dotnet versions...
+    container:
+      image: alpine:3.17
+    strategy:
+      matrix:
+        dotnet:
+          - '7.0'
+          - '6.0'
+    steps:
+      - uses: actions/checkout@v3
+      # install required dotnet dependencies
+      # https://learn.microsoft.com/en-us/dotnet/core/install/linux-alpine#dependencies
+      - run: apk add --no-cache bash icu-libs krb5-libs libgcc libintl libssl1.1 libstdc++ zlib
+      # delete global.json since we want to use custom versions here
+      - run: rm global.json
+      - uses: actions/setup-dotnet@v3.0.3
+        with:
+          dotnet-version: ${{ matrix.dotnet }}
+      - uses: actions/download-artifact@v3
+        with:
+          name: mapperly-nupkg
+          path: artifacts
+
+      # use nupkg artifact for integration tests instead of project references
+      - run: dotnet nuget add source "$(pwd)/artifacts"
+      - run: >-
+          dotnet build
+          -f net${{ matrix.dotnet }}
+          -p:MapperlyIntegrationTestsTargetFramework=net${{ matrix.dotnet }}
+          -p:MapperlyNugetPackageVersion="0.0.1-dev.$GITHUB_RUN_ID"
+        working-directory: ./test/Riok.Mapperly.IntegrationTests
+      - run: dotnet test --no-build -f net${{ matrix.dotnet }}
+        working-directory: ./test/Riok.Mapperly.IntegrationTests
+      - if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: verify-test-results
+          path: '**/*.received.*'
+  integration-test-net-framework:
+    needs: package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      # delete global.json since we want to use custom versions here
+      - run: rm global.json
+      - uses: actions/download-artifact@v3
+        with:
+          name: mapperly-nupkg
+          path: artifacts
+
+      # use nupkg artifact for integration tests instead of project references
+      - run: dotnet nuget add source "$(Get-Location)/artifacts"
+      - run: >-
+          dotnet build
+          -f net48
+          -p:MapperlyIntegrationTestsTargetFramework=net48
+          -p:MapperlyNugetPackageVersion=0.0.1-dev.$env:GITHUB_RUN_ID
+        working-directory: ./test/Riok.Mapperly.IntegrationTests
+      - run: dotnet test --no-build -f net48
+        working-directory: ./test/Riok.Mapperly.IntegrationTests
+      - if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: verify-test-results
+          path: '**/*.received.*'
